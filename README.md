@@ -8,3 +8,4 @@ make sure to select HTGame.exe as your game process!
 
 Dont mess with the settings if you dk what youre doing!!!!
 
+ONLY works for 1920x1080 and 1600x900 (ingame resolution)
