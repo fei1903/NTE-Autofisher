@@ -1,4 +1,5 @@
 <img width="1915" height="976" alt="image" src="https://github.com/user-attachments/assets/0494943f-3554-4dc2-8fa1-5d3169e07c0c" />
+
 ## NTE AutoFisher
 
 An automatic fishing bot for **NTE** that detects fishing prompts using computer vision.  
