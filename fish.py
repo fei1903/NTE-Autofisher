@@ -11,6 +11,38 @@ def _require_admin():
 
 _require_admin()
 
+import sys, os
+
+# ── Dependency check — show a clear message if packages are missing ───────────
+_REQUIRED = ["cv2", "numpy", "mss", "win32gui", "win32con",
+             "win32api", "win32process", "psutil"]
+_missing = []
+for _pkg in _REQUIRED:
+    try:
+        __import__(_pkg)
+    except ImportError:
+        _missing.append(_pkg)
+
+if _missing:
+    try:
+        import tkinter as _tk
+        _r = _tk.Tk(); _r.title("Missing packages")
+        _tk.Label(_r, text="The following required packages are not installed:\n\n" +
+                  "\n".join(_missing) +
+                  "\n\nRun:  pip install " + " ".join(
+                      p.replace("cv2","opencv-python")
+                       .replace("win32gui","pywin32")
+                       .replace("win32con","pywin32")
+                       .replace("win32api","pywin32")
+                       .replace("win32process","pywin32")
+                      for p in _missing),
+                  justify="left", padx=20, pady=20).pack()
+        _tk.Button(_r, text="Close", command=_r.destroy, padx=20).pack(pady=10)
+        _r.mainloop()
+    except Exception:
+        print("Missing packages:", _missing)
+    sys.exit(1)
+
 import cv2
 import numpy as np
 import mss
@@ -25,7 +57,6 @@ import threading
 import tkinter as tk
 import tkinter.ttk as ttk
 import queue
-import sys
 import traceback
 from datetime import timedelta
 
@@ -209,6 +240,38 @@ def find_green_bounds(mask):
         return None, None
     return int(xs.min()), int(xs.max())
 
+def detect_result_screen(img):
+    """
+    Return True when the catch-result overlay is visible.
+    Requires BOTH signals to be clearly present to avoid false positives.
+
+    Signal 1 — Bright cyan-blue radial glow (the burst around the fish medallion).
+    Signal 2 — Dark pill-shaped info bars in the lower portion of the card.
+    """
+    h, w = img.shape[:2]
+
+    # ── 1. Bright cyan-blue glow in centre of screen ──────────────────────────
+    cx0 = int(w * 0.25); cx1 = int(w * 0.75)
+    cy0 = int(h * 0.20); cy1 = int(h * 0.75)
+    centre = img[cy0:cy1, cx0:cx1]
+    hsv_c  = cv2.cvtColor(centre, cv2.COLOR_BGR2HSV)
+
+    # Tight cyan-blue range: hue 95-125, very high sat+val (the burst is very vivid)
+    blue_glow = cv2.inRange(hsv_c,
+                            np.array([95,  160, 170]),
+                            np.array([125, 255, 255]))
+    glow_ratio = np.count_nonzero(blue_glow) / blue_glow.size
+
+    if glow_ratio < 0.12:   # must be a large vivid blob, not just a hint of blue
+        return False
+
+    # ── 2. Dark pill bars in lower third ──────────────────────────────────────
+    bar_strip = img[int(h * 0.74): int(h * 0.84), int(w * 0.20): int(w * 0.80)]
+    gray_bar  = cv2.cvtColor(bar_strip, cv2.COLOR_BGR2GRAY)
+    dark_ratio = np.count_nonzero(gray_bar < 50) / gray_bar.size
+
+    return dark_ratio > 0.30
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  MACRO CORE
 # ══════════════════════════════════════════════════════════════════════════════
@@ -280,15 +343,25 @@ def auto_fishing(cfg: dict, stop_ev: threading.Event, catches_ref: list, restart
     smooth_vel        = 0.0
 
     # Anti-spam + per-catch timing
-    MIN_REEL_DURATION  = 2.5   # seconds — ignore catches faster than this (false positives)
-    POST_CATCH_COOLDOWN = 1.5  # seconds — wait after a catch before detecting again
+    MIN_REEL_DURATION  = 2.5
+    POST_CATCH_COOLDOWN = 1.5
     reel_start_time    = None
     last_catch_time    = 0.0
-    catch_durations    = []    # rolling list of real catch durations (seconds)
+    catch_durations    = []
+
+    # Result-screen detection: require N consecutive positive frames before acting
+    # and ignore detections during the startup grace period.
+    RESULT_CONFIRM_FRAMES = 3      # frames in a row needed to confirm
+    STARTUP_GRACE         = 4.0    # seconds after start where detection is suppressed
+    result_screen_streak  = 0
+    start_time            = time.time()
 
     if SHOW_DEBUG:
         cv2.namedWindow("Debug Vision", cv2.WINDOW_NORMAL)
-        cv2.resizeWindow("Debug Vision", SLIDER_ROI[2] * 2, SLIDER_ROI[3] * 6)
+        # Use pixel equivalents of the ROI fractions for the debug window size
+        _dbg_w = int(SLIDER_ROI[2] * 1920)
+        _dbg_h = int(SLIDER_ROI[3] * 1080)
+        cv2.resizeWindow("Debug Vision", _dbg_w * 2, _dbg_h * 6)
 
     def switch_key(new_key):
         nonlocal current_key
@@ -311,7 +384,17 @@ def auto_fishing(cfg: dict, stop_ev: threading.Event, catches_ref: list, restart
                 img = cv2.cvtColor(raw, cv2.COLOR_BGRA2BGR)
                 img = cv2.resize(img, (1920, 1080))
 
-                x, y, w, h = SLIDER_ROI
+                # Compute ROI from relative fractions of the normalised 1920×1080 frame.
+                # slider_roi in config is stored as (rx, ry, rw, rh) — all 0..1 fractions.
+                # This means the region tracks correctly regardless of windowed vs fullscreen.
+                IW, IH = 1920, 1080
+                rx, ry, rw, rh = SLIDER_ROI   # fractions
+                x  = int(rx * IW)
+                y  = int(ry * IH)
+                w  = int(rw * IW)
+                h  = int(rh * IH)
+                h  = max(h, 1)
+                w  = max(w, 1)
                 roi = img[y:y+h, x:x+w]
                 hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
 
@@ -356,6 +439,34 @@ def auto_fishing(cfg: dict, stop_ev: threading.Event, catches_ref: list, restart
                     state_queue.put(("RESTARTING", catches_ref[0], restarts_ref[0], catch_durations[:]))
                     break
 
+                # Passive result-screen detector — catches the overlay even if the
+                # state machine missed it (e.g. extremely fast catch or edge case).
+                # Requires RESULT_CONFIRM_FRAMES consecutive detections to act,
+                # and is suppressed during the startup grace period.
+                if state in ("IDLE", "REELING") and (now - start_time) > STARTUP_GRACE:
+                    if detect_result_screen(img):
+                        result_screen_streak += 1
+                    else:
+                        result_screen_streak = 0
+
+                    if result_screen_streak >= RESULT_CONFIRM_FRAMES:
+                        result_screen_streak = 0
+                        _log("Result screen detected — switching to DISMISSING")
+                        switch_key(None)
+                        if state == "REELING" and reel_start_time:
+                            reel_duration = now - reel_start_time
+                            if reel_duration >= MIN_REEL_DURATION:
+                                catch_durations.append(reel_duration)
+                                if len(catch_durations) > 30:
+                                    catch_durations.pop(0)
+                                catches_ref[0] += 1
+                                _log(f"Catch #{catches_ref[0]} ({reel_duration:.1f}s) via screen detect")
+                        reel_start_time = None
+                        state           = "DISMISSING"
+                        state_timer     = now
+                else:
+                    result_screen_streak = 0
+
                 if state == "IDLE":
                     state_queue.put(("IDLE", catches_ref[0], restarts_ref[0], catch_durations[:]))
                     if gmin is not None and (now - last_catch_time) >= POST_CATCH_COOLDOWN:
@@ -399,13 +510,64 @@ def auto_fishing(cfg: dict, stop_ev: threading.Event, catches_ref: list, restart
                                 catch_durations.pop(0)
                             catches_ref[0] += 1
                             last_catch_time = now
-                            _log(f"Catch #{catches_ref[0]} ({reel_duration:.1f}s)")
+                            _log(f"Catch #{catches_ref[0]} ({reel_duration:.1f}s) - dismissing result screen...")
+                            state_queue.put(("IDLE", catches_ref[0], restarts_ref[0], catch_durations[:]))
+                            state       = "DISMISSING"
+                            state_timer = now
                         else:
                             _log(f"False positive ignored ({reel_duration:.1f}s reel)")
-                        state_queue.put(("IDLE", catches_ref[0], restarts_ref[0], catch_durations[:]))
-                        state       = "IDLE"
-                        state_timer = now
+                            state_queue.put(("IDLE", catches_ref[0], restarts_ref[0], catch_durations[:]))
+                            state       = "IDLE"
+                            state_timer = now
                         reel_start_time = None
+
+                elif state == "DISMISSING":
+                    # Only click to dismiss when the result screen is actually visible.
+                    state_queue.put(("IDLE", catches_ref[0], restarts_ref[0], catch_durations[:]))
+                    h2 = get_hwnd_by_process_name(PROC)
+
+                    if detect_result_screen(img):
+                        # Screen confirmed — click empty corners around the card
+                        if h2:
+                            r2  = win32gui.GetClientRect(h2)
+                            cw, ch = r2[2], r2[3]
+                            dismiss_spots = [
+                                (int(cw * 0.05), int(ch * 0.05)),   # top-left
+                                (int(cw * 0.95), int(ch * 0.05)),   # top-right
+                                (int(cw * 0.05), int(ch * 0.92)),   # bottom-left
+                                (int(cw * 0.95), int(ch * 0.92)),   # bottom-right
+                                (int(cw * 0.85), int(ch * 0.50)),   # mid-right edge
+                            ]
+                            for dx, dy in dismiss_spots:
+                                lp2 = win32api.MAKELONG(dx, dy)
+                                _post(h2, win32con.WM_LBUTTONDOWN, win32con.MK_LBUTTON, lp2)
+                                time.sleep(0.05)
+                                _post(h2, win32con.WM_LBUTTONUP, 0, lp2)
+                                time.sleep(0.05)
+                    else:
+                        # Screen already gone — resume fishing
+                        if gmin is not None and (now - state_timer) > POST_CATCH_COOLDOWN:
+                            _log("Result screen dismissed, resuming...")
+                            last_catch_time   = now
+                            smooth_vel        = 0.0
+                            last_green_center = (gmin + gmax) // 2
+                            last_valid_time   = now
+                            reel_start_time   = now
+                            state             = "REELING"
+                            state_timer       = now
+                        elif (now - state_timer) > POST_CATCH_COOLDOWN:
+                            # No green bar yet but screen gone — go to IDLE
+                            _log("Result screen dismissed, waiting for cast...")
+                            last_catch_time = now
+                            state           = "IDLE"
+                            state_timer     = now
+
+                    # Hard timeout — if somehow stuck for too long, restart
+                    if (now - state_timer) > 10.0:
+                        _log("Dismiss timeout - restarting...")
+                        restarts_ref[0] += 1
+                        state_queue.put(("RESTARTING", catches_ref[0], restarts_ref[0], catch_durations[:]))
+                        break
 
     except Exception as e:
         _log_err(f"Macro crashed: {e}")
@@ -455,6 +617,8 @@ class FishingApp(tk.Tk):
         self._hotkey_stop     = threading.Event()
         self._topmost_var     = tk.BooleanVar(value=False)
         self._hotkey_var      = tk.StringVar(value="F6")
+        self._start_delay_on  = tk.BooleanVar(value=True)
+        self._start_delay_var = tk.StringVar(value="5")
 
         self._build_ui()
         self._load_settings()
@@ -462,6 +626,8 @@ class FishingApp(tk.Tk):
         self._hotkey_var.trace_add("write", lambda *_: self._save_settings())
         self._topmost_var.trace_add("write", lambda *_: self._save_settings())
         self._debug_var.trace_add("write", lambda *_: self._save_settings())
+        self._start_delay_on.trace_add("write", lambda *_: self._save_settings())
+        self._start_delay_var.trace_add("write", lambda *_: self._save_settings())
         for var in self._vars.values():
             var.trace_add("write", lambda *_: self._save_settings())
         self._process_var.trace_add("write", lambda *_: self._save_settings())
@@ -629,6 +795,36 @@ class FishingApp(tk.Tk):
                        activebackground=BG2, activeforeground=ACCENT,
                        font=FONT_MONO).pack(side="left")
 
+        # ── Start delay section ───────────────────────────────────────────────
+        sf = self._panel(body, "START DELAY", pady_bottom=8)
+        sg = tk.Frame(sf, bg=BG2, padx=10, pady=8)
+        sg.pack(fill="x")
+
+        # Row 1: enable toggle
+        row1 = tk.Frame(sg, bg=BG2)
+        row1.pack(fill="x", pady=(0, 6))
+        self._delay_check = tk.Checkbutton(
+            row1, text="Enable start delay  (time to switch to the game)",
+            variable=self._start_delay_on,
+            command=self._update_delay_state,
+            bg=BG2, fg=TEXT, selectcolor=BG3,
+            activebackground=BG2, activeforeground=ACCENT,
+            font=FONT_MONO)
+        self._delay_check.pack(side="left")
+
+        # Row 2: interval entry
+        row2 = tk.Frame(sg, bg=BG2)
+        row2.pack(fill="x")
+        tk.Label(row2, text="Delay (seconds)", font=FONT_MONO,
+                 bg=BG2, fg=TEXT_DIM, anchor="w", width=16).pack(side="left")
+        self._delay_entry = tk.Entry(
+            row2, textvariable=self._start_delay_var,
+            font=FONT_MONO, bg=BG3, fg=ACCENT, insertbackground=ACCENT,
+            relief="flat", bd=4, width=6,
+            highlightthickness=1, highlightbackground=BORDER, highlightcolor=ACCENT)
+        self._delay_entry.pack(side="left", padx=(8, 0))
+        self._update_delay_state()
+
         # ── Process picker ────────────────────────────────────────────────────
         self._vars = {}
         pf = self._panel(body, "PROCESS", pady_bottom=8)
@@ -733,9 +929,11 @@ class FishingApp(tk.Tk):
     def _save_settings(self):
         import json, os
         data = {
-            "hotkey":       self._hotkey_var.get(),
-            "process":      self._process_var.get(),
+            "hotkey":        self._hotkey_var.get(),
+            "process":       self._process_var.get(),
             "always_on_top": self._topmost_var.get(),
+            "start_delay_on": self._start_delay_on.get(),
+            "start_delay":    self._start_delay_var.get(),
         }
         for key, var in self._vars.items():
             data[key] = var.get()
@@ -760,6 +958,11 @@ class FishingApp(tk.Tk):
         if "always_on_top" in data:
             self._topmost_var.set(data["always_on_top"])
             self._apply_topmost()
+        if "start_delay_on" in data:
+            self._start_delay_on.set(data["start_delay_on"])
+            self._update_delay_state()
+        if "start_delay" in data:
+            self._start_delay_var.set(data["start_delay"])
         for key, var in self._vars.items():
             if key in data:
                 var.set(data[key])
@@ -769,6 +972,13 @@ class FishingApp(tk.Tk):
     # ── Always-on-top ─────────────────────────────────────────────────────────
     def _apply_topmost(self):
         self.wm_attributes("-topmost", self._topmost_var.get())
+
+    def _update_delay_state(self):
+        """Grey out the delay entry when the toggle is off."""
+        if hasattr(self, "_delay_entry"):
+            state = "normal" if self._start_delay_on.get() else "disabled"
+            fg    = ACCENT   if self._start_delay_on.get() else TEXT_DIM
+            self._delay_entry.config(state=state, fg=fg)
 
     def _update_footer_hotkey(self):
         key = self._hotkey_var.get().strip() or "F6"
@@ -997,7 +1207,9 @@ class FishingApp(tk.Tk):
             "state_timeout":  float(v["state_timeout"].get()),
             "idle_timeout":   float(v["idle_timeout"].get()),
             "show_debug":     self._debug_var.get(),
-            "slider_roi":     (608, 65, 713, 20),
+            # slider_roi as (x, y, w, h) fractions of 1920×1080 —
+            # keeps the detection region correct for any window size / fullscreen.
+            "slider_roi":     (608/1920, 65/1080, 713/1920, 20/1080),
             "green_lower":    np.array([70, 190,   0]),
             "green_upper":    np.array([90, 255, 255]),
             "yellow_lower":   np.array([ 0,   0, 215]),
@@ -1018,21 +1230,62 @@ class FishingApp(tk.Tk):
             self._append_log(f"[{time.strftime('%H:%M:%S')}] ERR Config error: {e}", "red")
             return
 
+        # Immediately flip button to STOP so hotkey/button can cancel during countdown
+        self._running = True
+        self._start_btn.config(text="STOP", bg=RED,
+                               activebackground="#cc0000",
+                               fg="white", activeforeground="white")
+        self._show_main()
+
+        delay_enabled = self._start_delay_on.get()
+        try:
+            delay_secs = max(0, int(float(self._start_delay_var.get())))
+        except ValueError:
+            delay_secs = 0
+
+        if delay_enabled and delay_secs > 0:
+            self._append_log(
+                f"[{time.strftime('%H:%M:%S')}] Starting in {delay_secs}s — switch to your game!", "yellow")
+            self._set_status("IDLE")
+            self._countdown(cfg, delay_secs)
+        else:
+            self._launch_macro(cfg)
+
+    def _countdown(self, cfg: dict, remaining: int):
+        """Tick down on the START button label, then launch when done."""
+        if not self._running:
+            # User cancelled during countdown
+            self._start_btn.config(text="START", bg=ACCENT,
+                                   activebackground=ACCENT2,
+                                   fg=BG, activeforeground=BG)
+            self._set_status("STOPPED")
+            return
+
+        if remaining > 0:
+            self._start_btn.config(text=f"{remaining}s…", bg=YELLOW,
+                                   activebackground=YELLOW,
+                                   fg=BG, activeforeground=BG)
+            self.after(1000, lambda: self._countdown(cfg, remaining - 1))
+        else:
+            self._start_btn.config(text="STOP", bg=RED,
+                                   activebackground="#cc0000",
+                                   fg="white", activeforeground="white")
+            self._launch_macro(cfg)
+
+    def _launch_macro(self, cfg: dict):
+        """Actually start the macro thread after any delay has elapsed."""
+        if not self._running:
+            return
         stop_event.clear()
         threading.Thread(target=macro_runner, args=(cfg,), daemon=True).start()
 
-        self._running         = True
         self._start_time      = time.time()
         self._catches         = 0
         self._restarts        = 0
         self._catch_durations = []
 
-        self._start_btn.config(text="STOP", bg=RED,
-                               activebackground="#cc0000",
-                               fg="white", activeforeground="white")
         self._set_status("SEARCHING")
         self._append_log(f"[{time.strftime('%H:%M:%S')}] Started -> {cfg['process']}", "green")
-        self._show_main()   # auto-switch back to main when starting
 
     def _stop(self):
         stop_event.set()
@@ -1095,7 +1348,52 @@ class FishingApp(tk.Tk):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+def _show_crash(exc: str):
+    """Show a plain Tk error dialog so crashes are never silent."""
+    try:
+        import tkinter as _tk, tkinter.scrolledtext as _st
+        root = _tk.Tk()
+        root.title("NTE Auto Fisher — Crash")
+        root.configure(bg="#0b0f0b")
+        root.resizable(True, True)
+        _tk.Label(root, text="The app crashed. Details below:",
+                  bg="#0b0f0b", fg="#ff4444",
+                  font=("Consolas", 10, "bold")).pack(pady=(10, 4), padx=10, anchor="w")
+        box = _st.ScrolledText(root, width=90, height=24,
+                               bg="#111711", fg="#c8e6c8",
+                               font=("Consolas", 9), relief="flat")
+        box.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+        box.insert("end", exc)
+        box.config(state="disabled")
+        _tk.Button(root, text="Close", command=root.destroy,
+                   bg="#2a3d2a", fg="#c8e6c8", relief="flat",
+                   font=("Consolas", 9), padx=20, pady=6).pack(pady=(0, 10))
+        root.mainloop()
+    except Exception:
+        pass   # absolute last resort — at least the log file was written
+
 if __name__ == "__main__":
-    app = FishingApp()
-    app._start_hotkey_listener()   # start default hotkey (F6) on launch
-    app.mainloop()
+    import os, traceback as _tb
+
+    # Write all crashes to a log file next to the script so they're never lost
+    _log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                             "nte_crash.log")
+
+    def _excepthook(etype, val, tb):
+        msg = "".join(_tb.format_exception(etype, val, tb))
+        try:
+            with open(_log_path, "a") as f:
+                f.write(f"\n{'='*60}\n{time.strftime('%Y-%m-%d %H:%M:%S')}\n{msg}")
+        except Exception:
+            pass
+        print(msg, file=sys.stderr)
+        _show_crash(msg)
+
+    sys.excepthook = _excepthook
+
+    try:
+        app = FishingApp()
+        app._start_hotkey_listener()
+        app.mainloop()
+    except Exception:
+        _excepthook(*sys.exc_info())
